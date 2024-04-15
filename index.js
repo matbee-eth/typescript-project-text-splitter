@@ -1,8 +1,7 @@
-import fs from 'fs';
-
-import path from 'path';
-import ts from 'typescript';
-import mermaid from 'mermaid';
+const fs = require('fs');
+const path = require('path');
+const ts = require('typescript');
+const mermaid = import('mermaid');
 
 // Function to split code into chunks based on maximum size and class/function boundaries
 function splitCodeIntoChunks(code, maxSize, filePath) {
@@ -50,6 +49,7 @@ function splitCodeIntoChunks(code, maxSize, filePath) {
 
 // Extract generic type parameters
 function extractGenericTypes(node) {
+  console.log("extractGenericTypes", node?.typeParameters?.map((param) => param.name.text).join(', '));
   if (node.typeParameters) {
     return `<${node.typeParameters.map((param) => param.name.text).join(', ')}>`;
   }
@@ -66,6 +66,34 @@ function findNextNode(node, sourceFile) {
     }
   }
   return nextNode;
+}
+
+function getFunctionFromNode(node, label) {
+  console.log("getFunctionFromNode isFunctionDeclaration", node?.name, label)
+  const functionName = node.name?.getText?.() ?? label ?? 'anonymous';;
+  const parameters = node.parameters.map((param) => {
+    const paramType = extractType(param.type);
+    if (ts.isObjectBindingPattern(param.name)) {
+      const elements = param.name.elements.map((element) => {
+        const name = element.name.getText();
+        console.info("paramType", paramType)
+        const type = paramType === name ? paramType : 'any';
+        return { name, type };
+      });
+      return elements;
+    } else {
+      const paramName = param.name.getText();
+      return { name: paramName, type: paramType };
+    }
+  }).flat();
+  let returnType = node.type ? extractType(node.type) : null;
+  if (!returnType) {
+    returnType = inferReturnType(node)
+  }
+  console.log("getFunctionFromNode returnType", returnType, typeof returnType)
+  const genericTypes = extractGenericTypes(node);
+  console.log("getFunctionFromNode returnType??", JSON.stringify(returnType))
+  return { name: functionName, parameters, returnType, genericTypes }
 }
 
 // Function to parse TypeScript code and extract detailed information
@@ -114,16 +142,22 @@ function parseTypeScriptCode(code, filePath) {
           const parameters = member.parameters.map((param) => {
             const paramName = param.name.getText();
             const paramType = param.type ? param.type.getText() : 'any';
-            return `${paramName}: ${paramType}`;
+            return { name: paramName, type: paramType };
           });
+          console.log("returnType??", member.type, member.type.getText())
           const returnType = member.type ? member.type.getText() : 'void';
-          methods.push(`${methodName}(${parameters.join(', ')}): ${returnType}`);
+          methods.push({
+            name: methodName,
+            parameters,
+            returnType,
+          });
         }
       });
 
       classes.push({ name: className, properties, methods, dependencies: classDependencies, genericTypes });
 
-    } else if (ts.isInterfaceDeclaration(node) && node.name) {
+    }
+    if (ts.isInterfaceDeclaration(node) && node.name) {
       const interfaceName = node.name.text;
       const interfaceDependencies = [];
       const properties = [];
@@ -158,7 +192,8 @@ function parseTypeScriptCode(code, filePath) {
       });
       const genericTypes = extractGenericTypes(node);
       interfaces.push({ name: interfaceName, properties, methods, dependencies: interfaceDependencies, genericTypes });
-    } else if (ts.isTypeAliasDeclaration(node) && node.name) {
+    }
+    if (ts.isTypeAliasDeclaration(node) && node.name) {
       const typeName = node.name.text;
       const typeDefinition = node.type.getText();
       types.push({ name: typeName, definition: typeDefinition });
@@ -166,24 +201,39 @@ function parseTypeScriptCode(code, filePath) {
       const enumName = node.name.text;
       const members = node.members.map((member) => member.name.getText());
       enums.push({ name: enumName, members });
-    } else if (ts.isFunctionDeclaration(node) && node.name) {
-      const functionName = node.name.text;
-      const parameters = node.parameters.map((param) => {
-        const paramName = param.name.getText();
-        const paramType = param.type ? param.type.getText() : 'any';
-        return `${paramName}: ${paramType}`;
-      });
-      const returnType = node.type ? node.type.getText() : 'void';
-      const genericTypes = extractGenericTypes(node);
-      functions.push({ name: functionName, parameters: parameters.join(', '), returnType, genericTypes });
-    } else if (ts.isVariableStatement(node) || ts.isFunctionDeclaration(node)) {
+    }
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      // console.log("isFunctionDeclaration")
+      // const functionName = node.name.text;
+      // const parameters = node.parameters.map((param) => {
+      //   const paramType = extractType(param.type);
+      //   if (ts.isObjectBindingPattern(param.name)) {
+      //     const elements = param.name.elements.map((element) => {
+      //       const name = element.name.getText();
+      //       console.info("paramType", paramType)
+      //       const type = paramType === name ? paramType : 'any';
+      //       return { name, type };
+      //     });
+      //     return elements;
+      //   } else {
+      //     const paramName = param.name.getText();
+      //     return { name: paramName, type: paramType };
+      //   }
+      // }).flat();
+      // const returnType = node.type ? extractType(node.type) : 'void';
+      // const genericTypes = extractGenericTypes(node);
+      const { name, parameters, returnType, genericTypes } = getFunctionFromNode(node);
+      functions.push({ name, parameters, returnType, genericTypes });
+    }
+    if (ts.isVariableStatement(node) || ts.isFunctionDeclaration(node)) {
       const componentName = node.name?.text;
       if (componentName && isReactComponent(node)) {
         const props = extractReactProps(node);
         const genericTypes = extractGenericTypes(node);
         components.push({ name: componentName, props, genericTypes });
       }
-    } else if (ts.isImportDeclaration(node)) {
+    }
+    if (ts.isImportDeclaration(node)) {
       const importPath = node.moduleSpecifier.getText().replace(/['"]/g, '');
       const importNames = [];
       let defaultImport = '';
@@ -205,13 +255,123 @@ function parseTypeScriptCode(code, filePath) {
       }
 
       imports.push({ path: importPath, names: importNames, defaultImport });
-    } else if (ts.isExportDeclaration(node)) {
+    }
+    // Extract export information
+    if (ts.isExportDeclaration(node)) {
+      console.log("ts.isExportDeclaration")
       if (node.exportClause && node.exportClause.elements) {
         node.exportClause.elements.forEach((element) => {
-          exports.push(element.name.getText());
+          exports.push({ name: element.name.getText(), type: "variable" });
         });
+      } else if (node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+        const exportedModule = node.moduleSpecifier.text;
+        exports.push({ name: `* as ${exportedModule}`, type: "module" });
+      }
+    } else if (ts.isExportAssignment(node)) {
+      console.log("ts.isExportAssignment")
+      if (ts.isIdentifier(node.expression)) {
+        exports.push({ name: "default", type: "variable" });
+      } else if (ts.isFunctionDeclaration(node.expression)) {
+        exports.push({ name: "default", type: "function" });
+      } else if (ts.isClassDeclaration(node.expression)) {
+        exports.push({ name: "default", type: "class" });
+      } else if (ts.isCallExpression(node.expression)) {
+        exports.push({ name: "default", type: "function" });
+      }
+    } else if (ts.isVariableStatement(node) && node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.ExportKeyword)) {
+      node.declarationList.declarations.forEach((declaration) => {
+        if (ts.isVariableDeclaration(declaration)) {
+          console.log("isVariableDeclaration")
+          const variableName = declaration.name.getText();
+          const { type, value } = extractValue(declaration.initializer, declaration.name.getText());
+          console.log("adding:::", { name: variableName, type, value })
+          exports.push({ name: variableName, type, value });
+        }
+      });
+    }
+
+    // Extract default exported declarations
+    if (node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.ExportKeyword) &&
+      node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.DefaultKeyword)) {
+      if (ts.isFunctionDeclaration(node)) {
+        const functionName = node.name ? node.name.getText() : 'anonymous';
+        exports.push({ name: "default", type: "function" });
+
+        // Extract function information
+        const parameters = node.parameters.map((param) => {
+          const paramType = extractType(param.type);
+          if (ts.isObjectBindingPattern(param.name)) {
+            const elements = param.name.elements.map((element) => {
+              const name = element.name.getText();
+              const type = paramType.find((prop) => prop.name === name)?.type || 'any';
+              return { name, type };
+            });
+            return elements;
+          } else {
+            const paramName = param.name.getText();
+            return { name: paramName, type: paramType };
+          }
+        }).flat();
+        const returnType = node.type ? extractType(node.type) : 'void';
+        const genericTypes = extractGenericTypes(node);
+        const isAsync = node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.AsyncKeyword);
+        functions.push({ name: functionName, parameters, returnType, genericTypes, isAsync });
+      } else if (ts.isVariableDeclaration(node)) {
+        console.log("isVariableDeclaration")
+        exports.push({ name: "default", type: "variable" });
       }
     }
+
+    // Extract named export information
+    ts.forEachChild(node, (child) => {
+      if (ts.isVariableStatement(child)) {
+        child.declarationList.declarations.forEach((declaration) => {
+          if (declaration.initializer && isExportedDeclaration(declaration)) {
+            console.log("isExportedDeclaration")
+            const exportName = declaration.name.getText();
+            const exportValue = extractValue(declaration.initializer);
+            exports.push({ name: exportName, type: "variable", value: exportValue });
+          }
+        });
+      } else if (ts.isFunctionDeclaration(child) && child.name && isExportedDeclaration(child)) {
+        const exportName = child.name.text;
+        const isAsync = child.modifiers?.some(mod => mod.kind === ts.SyntaxKind.AsyncKeyword);
+        exports.push({ name: exportName, type: isAsync ? "asyncFunction" : "function" });
+
+        // Extract function information
+        const functionName = child.name.text;
+        const parameters = child.parameters.map((param) => {
+          const paramType = extractType(param.type);
+          if (ts.isObjectBindingPattern(param.name)) {
+            const elements = param.name.elements.map((element) => {
+              const name = element.name.getText();
+              const type = paramType.find((prop) => prop.name === name)?.type || 'any';
+              return { name, type };
+            });
+            return elements;
+          } else {
+            const paramName = param.name.getText();
+            return { name: paramName, type: paramType };
+          }
+        }).flat();
+        console.log("ts.isFunctionDeclaration parameters", parameters)
+        const returnType = child.type ? extractType(child.type) : 'void';
+        const genericTypes = extractGenericTypes(child);
+        functions.push({ name: functionName, parameters, returnType, genericTypes, isAsync });
+      } else if (ts.isClassDeclaration(child) && child.name && isExportedDeclaration(child)) {
+        const exportName = child.name.text;
+        exports.push({ name: exportName, type: "class" });
+      } else if (ts.isInterfaceDeclaration(child) && child.name && isExportedDeclaration(child)) {
+        const exportName = child.name.text;
+        exports.push({ name: exportName, type: "interface" });
+      } else if (ts.isTypeAliasDeclaration(child) && child.name && isExportedDeclaration(child)) {
+        const exportName = child.name.text;
+        exports.push({ name: exportName, type: "typeAlias" });
+      } else if (ts.isEnumDeclaration(child) && child.name && isExportedDeclaration(child)) {
+        const exportName = child.name.text;
+        exports.push({ name: exportName, type: "enum" });
+      }
+    });
   });
 
   // Extract usage relationships
@@ -288,13 +448,50 @@ function isJSXElement(node) {
   return ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node);
 }
 
+function extractValue(node, label) {
+  if (ts.isObjectLiteralExpression(node)) {
+    const properties = {};
+    node.properties.forEach((property) => {
+      if (ts.isPropertyAssignment(property)) {
+        const name = property.name.getText();
+        const value = extractValue(property.initializer, label);
+        properties[name] = value;
+      } else if (ts.isShorthandPropertyAssignment(property)) {
+        const name = property.name.getText();
+        const value = extractValue(property.name, label);
+        properties[name] = value;
+      }
+    });
+    return { kind: 'variable', type: 'property', value: properties };
+  } else if (ts.isArrayLiteralExpression(node)) {
+    return { kind: 'variable', type: 'array', value: node.elements.map((element) => extractValue(element, label)) };
+  } else if (ts.isStringLiteral(node)) {
+    return { kind: 'variable', type: 'string', value: node.text };
+  } else if (ts.isNumericLiteral(node)) {
+    return { kind: 'variable', type: 'number', value: Number(node.text) };
+  } else if (ts.isBooleanLiteral(node)) {
+    return { kind: 'variable', type: 'boolean', value: node.kind === ts.SyntaxKind.TrueKeyword };
+  } else if (ts.isIdentifier(node)) {
+    return { kind: 'variable', type: 'identifier', value: node.getText() };
+  } else if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    const nodeValue = getFunctionFromNode(node, label);
+    console.log("extractValue ts.isArrowFunction(node) || ts.isFunctionExpression(node)", nodeValue)
+
+    return { kind: 'variable', type: 'function', value: nodeValue };
+  } else {
+    return undefined;
+  }
+}
+
 // Function to extract React component props
 function extractReactProps(node) {
   const props = [];
   if (ts.isFunctionDeclaration(node)) {
     node.parameters.forEach((param) => {
       if (ts.isParameter(param) && param.type) {
-        props.push(param.name.text + ': ' + param.type.getText());
+        const paramType = extractType(param.type);
+        console.log("Returning prop type", paramType, param.name.text)
+        props.push({ name: param.name.text, type: paramType });
       }
     });
   } else if (ts.isVariableStatement(node)) {
@@ -302,13 +499,72 @@ function extractReactProps(node) {
       if (isFunctionExpression(declaration) && declaration.initializer.parameters) {
         declaration.initializer.parameters.forEach((param) => {
           if (ts.isParameter(param) && param.type) {
-            props.push(param.name.text + ': ' + param.type.getText());
+            const paramType = extractType(param.type);
+            console.log("Returning prop type", paramType, param.name.text)
+            props.push({ name: param.name.text, type: paramType });
           }
         });
       }
     });
   }
   return props;
+}
+// Function to extract the type from a node
+function extractType(node) {
+  if (!node) {
+    return 'any';
+  }
+
+  if (ts.isTypeLiteralNode(node)) {
+    console.log("isTypeLiteral")
+    const properties = node.members
+      .filter(ts.isPropertySignature)
+      .map((member) => ({
+        name: member.name.getText(),
+        type: extractType(member.type),
+      }));
+    console.log("returning", properties, node?.name, node?.typeName)
+    return properties;
+  } else if (ts.isTypeReferenceNode(node)) {
+    const typeName = node.typeName.getText();
+    const typeArguments = node.typeArguments
+      ? node.typeArguments.map(extractType)
+      : [];
+    console.log("isTypeReferenceNode", typeName, `<${typeArguments.map(JSON.stringify).join(', ')}>`)
+    return `${typeName}${typeArguments.length > 0 ? `<${typeArguments.map(JSON.stringify).join(', ')}>` : ''}`;
+  } else if (ts.isArrayTypeNode(node)) {
+    const elementType = extractType(node.elementType);
+    console.log("isArrayTypeNode", elementType)
+    return `${elementType}[]`;
+  } else {
+    console.log("else getText", node?.name, node.getText())
+    return node.getText();
+  }
+}
+
+// Helper function to infer the return type of a function
+function inferReturnType(node) {
+  const returnStatement = findReturnStatement(node);
+  if (returnStatement) {
+    const returnExpression = returnStatement.expression;
+    if (returnExpression) {
+      return extractType(returnExpression);
+    }
+  }
+  return 'void';
+}
+
+// Helper function to find the return statement within a function
+function findReturnStatement(node) {
+  let returnStatement = null;
+  ts.forEachChild(node, (child) => {
+    if (ts.isReturnStatement(child)) {
+      returnStatement = child;
+    } else if (ts.isBlock(child)) {
+      returnStatement = findReturnStatement(child);
+    }
+  });
+  return returnStatement;
 }
 
 // Function to generate Mermaid definition
@@ -346,15 +602,15 @@ function generateMermaidDefinition(classes, interfaces, types, enums, functions,
 
   // Add interfaces to the diagram
   interfaces.forEach((interfaceObj) => {
-    mermaidDefinition += `interface ${interfaceObj.name}${interfaceObj.genericTypes} {\n`;
+    mermaidDefinition += `class ${interfaceObj.name}${interfaceObj.genericTypes} {\n<<interface>>`;
     if (interfaceObj.properties) {
       interfaceObj.properties.forEach((property) => {
-        mermaidDefinition += `  ${property}\n`;
+        mermaidDefinition += `  +${property}\n`;
       });
     }
     if (interfaceObj.methods) {
       interfaceObj.methods.forEach((method) => {
-        mermaidDefinition += `  ${method}\n`;
+        mermaidDefinition += `  +${method}()\n`;
       });
     }
     mermaidDefinition += '}\n';
@@ -429,22 +685,21 @@ function generateMermaidDefinition(classes, interfaces, types, enums, functions,
   return mermaidDefinition;
 }
 
+const ignorePaths = ['dist', '.next', '.d.ts'];
 // Function to recursively process TypeScript files in a directory
 async function processDirectory(directory, maxContextSize, outputFile, onlyMermaid = false) {
   const files = await fs.promises.readdir(directory);
 
   for (const file of files) {
-    // Skip node_modules and .next directories
-    if (file === '.next') continue
     const isOnlyMermaid = onlyMermaid || file === 'node_modules';
-
     const filePath = path.join(directory, file);
     const stats = await fs.promises.stat(filePath);
 
     if (stats.isDirectory()) {
       // Recursively process subdirectories
+      if (ignorePaths.includes(file)) continue;
       await processDirectory(filePath, maxContextSize, outputFile, isOnlyMermaid);
-    } else if (stats.isFile() && (path.extname(file) === '.ts' || path.extname(file) === '.js' || path.extname(file) === '.tsx')) {
+    } else if (stats.isFile() && (!ignorePaths.includes(file)) && (path.extname(file) === '.ts' || path.extname(file) === '.js' || path.extname(file) === '.tsx' || path.extname(file) === '.jsx')) {
       // Process TypeScript files
       const code = await fs.promises.readFile(filePath, 'utf-8');
       const codeChunks = splitCodeIntoChunks(code, maxContextSize, filePath);
@@ -474,11 +729,29 @@ async function processDirectory(directory, maxContextSize, outputFile, onlyMerma
 const directoryPath = '/home/acidhax/dev/originals/dataset-manager-nextjs/'; // Replace with the path to your TypeScript directory
 const maxContextSize = 8000; // Specify the maximum context size in characters
 
-// Initialize Mermaid
-mermaid.initialize({
-  startOnLoad: true,
-});
+if (mermaid?.initialize) {
+  // Initialize Mermaid
+  mermaid.initialize({
+    startOnLoad: true,
+  });
+}
 
 // chunkTypeScriptFiles(directoryPath, maxContextSize);
-processDirectory(directoryPath, maxContextSize, 'crawled.jsonl');
+// processDirectory(directoryPath, maxContextSize, 'crawled.jsonl');
 
+(async () => {
+  try {
+    const filePath = '/home/acidhax/dev/originals/dataset-manager-nextjs/src/app/hooks/useProjectConfig.ts';
+    const code = await fs.promises.readFile(filePath, 'utf-8');
+    const parsedData = parseTypeScriptCode(code, filePath);
+    console.log(JSON.stringify(parsedData, null, 2));
+  } catch (error) {
+    console.error('Failed to test parseTypeScriptCode:', error);
+  }
+})();
+
+
+module.exports = {
+  parseTypeScriptCode,
+  splitCodeIntoChunks,
+}
