@@ -2,13 +2,22 @@ const fs = require('fs');
 const path = require('path');
 const ts = require('typescript');
 const mermaid = import('mermaid');
-
+const tsconfigPath = './tsconfig.json';
+const tsconfig = ts.readConfigFile(tsconfigPath, ts.sys.readFile).config;
+console.log("tsconfig", tsconfig)
 // Function to split code into chunks based on maximum size and class/function boundaries
 function splitCodeIntoChunks(code, maxSize, filePath) {
   const chunks = [];
   let currentChunk = '';
 
+  // Create a TypeScript compiler host
+  const compilerHost = ts.createCompilerHost(tsconfig.compilerOptions, true);
+
+  // Create a TypeScript program
   const sourceFile = ts.createSourceFile('temp.ts', code, ts.ScriptTarget.Latest, true);
+  const program = ts.createProgram([sourceFile], tsconfig.compilerOptions, compilerHost);
+
+
   let currentNode = sourceFile.getChildAt(0);
 
   while (currentNode) {
@@ -69,15 +78,14 @@ function findNextNode(node, sourceFile) {
 }
 
 function getFunctionFromNode(node, label) {
-  console.log("getFunctionFromNode isFunctionDeclaration", node?.name, label)
   const functionName = node.name?.getText?.() ?? label ?? 'anonymous';;
   const parameters = node.parameters.map((param) => {
-    const paramType = extractType(param.type);
+    const paramType = extractType(param.type).flat();
     if (ts.isObjectBindingPattern(param.name)) {
       const elements = param.name.elements.map((element) => {
         const name = element.name.getText();
-        console.info("paramType", paramType)
-        const type = paramType === name ? paramType : 'any';
+        // const type = paramType === name ? paramType : 'any';
+        const type = paramType.find((prop) => prop.name === name)?.type || 'any';
         return { name, type };
       });
       return elements;
@@ -86,22 +94,314 @@ function getFunctionFromNode(node, label) {
       return { name: paramName, type: paramType };
     }
   }).flat();
-  let returnType = node.type ? extractType(node.type) : null;
-  if (!returnType) {
-    returnType = inferReturnType(node)
+  let returnType = node.type ? extractType(node.type).flat() : null;
+  if (!returnType || !returnType.length) {
+    returnType = inferReturnType(node)?.[0]
   }
-  console.log("getFunctionFromNode returnType", returnType, typeof returnType)
   const genericTypes = extractGenericTypes(node);
-  console.log("getFunctionFromNode returnType??", JSON.stringify(returnType))
+
   return { name: functionName, parameters, returnType, genericTypes }
 }
 
-// Function to parse TypeScript code and extract detailed information
-function parseTypeScriptCode(code, filePath) {
-  const fileExtension = path.extname(filePath);
-  const scriptKind = fileExtension === '.tsx' || fileExtension === '.jsx' ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-  const sourceFile = ts.createSourceFile('temp' + fileExtension, code, ts.ScriptTarget.Latest, true, scriptKind);
+function isUsingImportedVariables(functionNode, sourceFile, checker, compilerOptions) {
+  const importedSymbols = [];
 
+  // Collect imported symbols and their paths
+  ts.forEachChild(sourceFile, (node) => {
+    if (ts.isImportDeclaration(node)) {
+      const importClause = node.importClause;
+      if (importClause && importClause.namedBindings) {
+        const namedBindings = importClause.namedBindings;
+        if (ts.isNamedImports(namedBindings)) {
+          namedBindings.elements.forEach((element) => {
+            const importedSymbol = checker.getSymbolAtLocation(element.name);
+            if (importedSymbol) {
+              const importPath = (node.moduleSpecifier).text;
+              importedSymbols.push({ symbol: importedSymbol, path: importPath });
+            }
+          });
+        }
+      }
+    }
+  });
+
+  const usedImportPaths = [];
+
+  function visit(node) {
+    if (ts.isIdentifier(node)) {
+      const symbol = checker.getSymbolAtLocation(node);
+      if (symbol) {
+        const importInfo = importedSymbols.find((info) => info.symbol === symbol);
+        if (importInfo) {
+          const resolvedModule = ts.resolveModuleName(importInfo.path, sourceFile.fileName, compilerOptions, ts.sys);
+          if (resolvedModule?.resolvedModule) {
+            const fullPath = resolvedModule.resolvedModule.resolvedFileName;
+            if (!usedImportPaths.includes(fullPath)) {
+              usedImportPaths.push(fullPath);
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  ts.forEachChild(functionNode.body, visit);
+
+  return usedImportPaths;
+}
+
+
+function getFileAndImportForNode(node, sourceFile, checker) {
+  let currentNode = node;
+  while (currentNode && currentNode.kind !== ts.SyntaxKind.SourceFile) {
+    if (currentNode.kind === ts.SyntaxKind.ImportDeclaration) {
+      const importDeclaration = currentNode;
+      const importClause = importDeclaration.importClause;
+      if (importClause && importClause.namedBindings) {
+        const namedBindings = importClause.namedBindings;
+        if (namedBindings.kind === ts.SyntaxKind.NamedImports) {
+          const namedImports = namedBindings;
+          const importSpecifier = namedImports.elements.find(element => element.name.text === node.getName());
+          if (importSpecifier) {
+            const importSymbol = checker.getSymbolAtLocation(importSpecifier);
+            if (importSymbol) {
+              const importDeclarationFile = importSymbol.declarations[0].getSourceFile().fileName;
+              return { file: importDeclarationFile, import: importDeclaration.moduleSpecifier.getText() };
+            }
+          }
+        }
+      }
+    }
+    currentNode = currentNode.parent;
+  }
+  return { file: sourceFile.fileName, import: undefined };
+}
+
+// Extractor functions for the knowledge graph
+function getFileDetails(sourceFile) {
+  return sourceFile.fileName; // Returns the file path
+}
+
+function getClassDetails(checker, sourceFile) {
+  const classes = [];
+  sourceFile.forEachChild(node => {
+    if (node.kind === ts.SyntaxKind.ClassDeclaration) {
+      const functions = getFunctionDetails(node)
+      node.name.text && classes.push({
+        name: node.name?.text, // Class name
+        members: functions
+      });
+    }
+  });
+  return classes;
+}
+
+function getFunctionDetails(sourceFile) {
+  const functions = [];
+  sourceFile.forEachChild(node => {
+    if (ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionLike(node)) {
+      node.name?.text && functions.push({
+        name: node.name.text, // Function name
+      });
+    }
+  });
+  return functions;
+}
+
+function getNodePath(program, compilerHost, sourceFile, node) {
+  const moduleSpecifier = node.moduleSpecifier
+  let resolvedFileName;
+  if (ts.isStringLiteral(moduleSpecifier)) {
+    const importPath = moduleSpecifier.text;
+    const resolvedModule = ts.resolveModuleName(importPath, sourceFile.fileName, program.getCompilerOptions(), compilerHost);
+
+    if (resolvedModule?.resolvedModule) {
+      resolvedFileName = resolvedModule.resolvedModule.resolvedFileName;
+      console.log(`Import "${importPath}" resolved to file: ${resolvedFileName}`);
+    } else {
+      resolvedFileName = importPath.replace(/['"]/g, '');
+      console.log(`Import "${importPath}" could not be resolved. Using ${resolvedFileName}.`, importPath, sourceFile.fileName);
+    }
+  }
+  return resolvedFileName;
+}
+
+function getImportDetails(program, compilerHost, sourceFile) {
+  const imports = [];
+  sourceFile.forEachChild((node) => {
+    if (node.kind === ts.SyntaxKind.ImportDeclaration) {
+      let resolvedFileName = getNodePath(program, compilerHost, sourceFile, node)
+
+      if (node.importClause) {
+        if (node.importClause.name) {
+          imports.push(node.importClause.name.getText());
+        }
+
+        if (node.importClause.namedBindings) {
+          if (ts.isNamedImports(node.importClause.namedBindings)) {
+            node.importClause.namedBindings.elements.forEach((element) => {
+              imports.push({
+                variableName: element.name.getText(),
+                fileName: resolvedFileName,
+              });
+            });
+          } else if (ts.isNamespaceImport(node.importClause.namedBindings)) {
+            imports.push({ name: node.importClause.namedBindings.name.getText(), fileName: resolvedFileName });
+          }
+        }
+      }
+    }
+  });
+  return imports;
+}
+
+function handleExportDeclaration(node, arr) {
+  if (ts.isExportDeclaration(node) && node.exportClause?.elements) {
+    node.exportClause.elements.forEach(e => arr.push({ name: e.getText(), type: "variable" }));
+  } else if (ts.isStringLiteral(node.moduleSpecifier)) {
+    arr.push({ name: `* as ${node.moduleSpecifier.text}`, type: "module" });
+  }
+}
+
+function handleExportedVariable(decl, arr) {
+  const name = decl.name.getText();
+  const initializer = decl.initializer;
+
+  if (initializer) {
+    const details = extractValue(initializer, name);
+    if (details) {
+      arr.push({ ...details, name });
+    }
+  }
+}
+
+function handleDefaultExportDeclaration(node, arr) {
+  if (ts.isFunctionDeclaration(node) && node?.name?.text !== "") {
+    arr.push({ name: node.name.text ?? 'anonymous', type: "function" });
+  } else if (ts.isVariableDeclaration(node)) {
+    arr.push({ name: "default", type: "variable" });
+  }
+}
+
+function isExportDeclaration(node) {
+  return ts.isExportDeclaration(node);
+}
+
+function isExportedVariableStatement(node) {
+  return ts.isVariableStatement(node) && node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+}
+
+function isDefaultExportDeclaration(node) {
+  return node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword) &&
+    node.modifiers?.some(m => m.kind === ts.SyntaxKind.DefaultKeyword);
+}
+
+function extractValue(initializer, varName) {
+  if (!initializer) return;
+
+  if (ts.isIdentifier(initializer)) return { type: "variable", value: initializer.getText() };
+  else if (ts.isStringLiteral(initializer)) return { type: 'string', value: initializer.text };
+  else if (ts.isNumericLiteral(initializer)) {
+    const value = initializer.numberValue; // Assuming the existence of numberValue for simplicity
+    return { type: typeof value, value };
+  }
+
+  return null;
+}
+
+// Main function
+function getExportDetails(sourceFile) {
+  const exports = [];
+  sourceFile.forEachChild((node) => {
+    if (isExportDeclaration(node)) {
+      handleExportDeclaration(node, exports);
+    } else if (isExportedVariableStatement(node)) {
+      node.declarationList.declarations.forEach(decl => handleExportedVariable(decl, exports));
+    } else if (isDefaultExportDeclaration(node)) {
+      handleDefaultExportDeclaration(node, exports);
+    }
+  });
+
+  return exports;
+}
+
+function isDefaultImport(imp) {
+  return !!imp.moduleSpecifier && imp.importClause?.name &&
+    ts.isStringLiteralLike(imp.moduleSpecifier) &&
+    ts.isIdentifier(imp.importClause.name);
+}
+
+function getVariableUsages(program, compilerHost, sourceFile) {
+  console.log(`\nDebugging for file: ${sourceFile.fileName}`);
+
+  const usages = [];
+  let variables = {}; // Initialize but with a broader type
+
+  sourceFile.forEachChild((node) => {
+    if (ts.isImportDeclaration(node)) {
+      let resolvedFileName = getNodePath(program, compilerHost, sourceFile, node)
+      if (isDefaultImport(node)) {
+        console.log(`Found import: ${node.moduleSpecifier.text} as ${node.importClause.name.text}`);
+        const variableName = node.importClause.name.text;
+
+        variables[variableName] = {
+          importPath: resolvedFileName,
+          importSource: node.moduleSpecifier.text,
+        };
+      } else {
+        handleNamedImports(node, variables, resolvedFileName);
+      }
+    } else if (variables && ts.isVariableStatement(node)) {
+      console.log(`Processing variable statement: ${node.getText()}`);
+      node.declarationList.declarations.forEach((decl) => {
+        if (ts.isIdentifier(decl.name)) {
+          const varName = decl.name.text;
+          variables[varName] && variables[varName].usageCount++;
+          console.log(`Found usage of ${varName}`);
+        }
+      });
+    }
+  });
+
+  console.log('Final Variables: ', variables);
+
+  for (const varName in variables) {
+    usages.push(variables[varName]);
+  }
+
+  return usages;
+}
+
+function handleNamedImports(imp, vars, importPath) {
+  console.log(`Found named imports in ${imp.moduleSpecifier.text}`);
+  if (imp?.importClause?.namedBindings) {
+    imp.importClause.namedBindings.forEachChild((binding) => {
+      if (binding.name && ts.isIdentifier(binding.name)) {
+        const variableName = binding.name.text;
+        vars[variableName] = {
+          importPath,
+          importSource: imp.moduleSpecifier.text,
+        };
+      }
+    });
+  }
+}
+
+function extractDetails(program, compilerHost, checker, sourceFile) {
+  const file = getFileDetails(sourceFile);
+  const classes = getClassDetails(checker, sourceFile);
+  const functions = getFunctionDetails(sourceFile);
+  const imports = getImportDetails(program, compilerHost, sourceFile);
+  const exports = getExportDetails(sourceFile);
+  const usages = getVariableUsages(program, compilerHost, sourceFile, imports);
+
+  return { file, classes, functions, imports, exports, usages };
+}
+
+
+// Function to parse TypeScript code and extract detailed information
+function parseTypeScriptCode(code, filePath, rootPath, cache) {
   const classes = [];
   const interfaces = [];
   const types = [];
@@ -111,318 +411,29 @@ function parseTypeScriptCode(code, filePath) {
   const exports = [];
   const components = [];
 
-  // Traverse the AST and extract detailed information
-  ts.forEachChild(sourceFile, (node) => {
-    // Extract class and interface relationships
-    if (ts.isClassDeclaration(node) && node.name) {
-      const className = node.name.text;
-      const classDependencies = [];
-      const properties = [];
-      const methods = [];
-      const genericTypes = extractGenericTypes(node);
+  console.log("Parsing code", filePath)
+  const fileExtension = path.extname(filePath);
+  const scriptKind = fileExtension === '.tsx' || fileExtension === '.jsx' ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const virtualFileName = `temp${fileExtension}`;
 
-      // Find class dependencies (imports, extends, implements)
-      node.heritageClauses?.forEach((clause) => {
-        if (clause.token === ts.SyntaxKind.ExtendsKeyword || clause.token === ts.SyntaxKind.ImplementsKeyword) {
-          clause.types.forEach((type) => {
-            const dependencyName = type.expression.getText();
-            classDependencies.push(dependencyName);
-          });
-        }
-      });
+  const tsconfigPath = './tsconfig.json';
+  const tsconfig = ts.readConfigFile(tsconfigPath, ts.sys.readFile).config;
+  const compilerHost = ts.createCompilerHost(tsconfig, true);
+  const parsedConfig = ts.parseJsonConfigFileContent(tsconfig, ts.sys, './');
+  const compilerOptions = parsedConfig.options;
 
-      // Extract class properties
-      node.members.forEach((member) => {
-        if (ts.isPropertyDeclaration(member) && member.name) {
-          const propertyName = member.name.getText();
-          const propertyType = member.type ? member.type.getText() : 'any';
-          properties.push(`${propertyName}: ${propertyType}`);
-        } else if (ts.isMethodDeclaration(member) && member.name) {
-          const methodName = member.name.getText();
-          const parameters = member.parameters.map((param) => {
-            const paramName = param.name.getText();
-            const paramType = param.type ? param.type.getText() : 'any';
-            return { name: paramName, type: paramType };
-          });
-          console.log("returnType??", member.type, member.type.getText())
-          const returnType = member.type ? member.type.getText() : 'void';
-          methods.push({
-            name: methodName,
-            parameters,
-            returnType,
-          });
-        }
-      });
+  const program = ts.createProgram([filePath], compilerOptions, compilerHost);
+  const checker = program.getTypeChecker();
 
-      classes.push({ name: className, properties, methods, dependencies: classDependencies, genericTypes });
-
+  program.getSourceFiles().forEach((sourceFile, i) => {
+    if (cache[sourceFile.fileName]) {
+      return
     }
-    if (ts.isInterfaceDeclaration(node) && node.name) {
-      const interfaceName = node.name.text;
-      const interfaceDependencies = [];
-      const properties = [];
-      const methods = [];
-
-      // Find interface dependencies (extends)
-      node.heritageClauses?.forEach((clause) => {
-        if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
-          clause.types.forEach((type) => {
-            const dependencyName = type.expression.getText();
-            interfaceDependencies.push(dependencyName);
-          });
-        }
-      });
-
-      // Extract interface properties and methods
-      node.members.forEach((member) => {
-        if (ts.isPropertySignature(member) && member.name) {
-          const propertyName = member.name.getText();
-          const propertyType = member.type ? member.type.getText() : 'any';
-          properties.push(`${propertyName}: ${propertyType}`);
-        } else if (ts.isMethodSignature(member) && member.name) {
-          const methodName = member.name.getText();
-          const parameters = member.parameters.map((param) => {
-            const paramName = param.name.getText();
-            const paramType = param.type ? param.type.getText() : 'any';
-            return `${paramName}: ${paramType}`;
-          });
-          const returnType = member.type ? member.type.getText() : 'void';
-          methods.push(`${methodName}(${parameters.join(', ')}): ${returnType}`);
-        }
-      });
-      const genericTypes = extractGenericTypes(node);
-      interfaces.push({ name: interfaceName, properties, methods, dependencies: interfaceDependencies, genericTypes });
-    }
-    if (ts.isTypeAliasDeclaration(node) && node.name) {
-      const typeName = node.name.text;
-      const typeDefinition = node.type.getText();
-      types.push({ name: typeName, definition: typeDefinition });
-    } else if (ts.isEnumDeclaration(node) && node.name) {
-      const enumName = node.name.text;
-      const members = node.members.map((member) => member.name.getText());
-      enums.push({ name: enumName, members });
-    }
-    if (ts.isFunctionDeclaration(node) && node.name) {
-      // console.log("isFunctionDeclaration")
-      // const functionName = node.name.text;
-      // const parameters = node.parameters.map((param) => {
-      //   const paramType = extractType(param.type);
-      //   if (ts.isObjectBindingPattern(param.name)) {
-      //     const elements = param.name.elements.map((element) => {
-      //       const name = element.name.getText();
-      //       console.info("paramType", paramType)
-      //       const type = paramType === name ? paramType : 'any';
-      //       return { name, type };
-      //     });
-      //     return elements;
-      //   } else {
-      //     const paramName = param.name.getText();
-      //     return { name: paramName, type: paramType };
-      //   }
-      // }).flat();
-      // const returnType = node.type ? extractType(node.type) : 'void';
-      // const genericTypes = extractGenericTypes(node);
-      const { name, parameters, returnType, genericTypes } = getFunctionFromNode(node);
-      functions.push({ name, parameters, returnType, genericTypes });
-    }
-    if (ts.isVariableStatement(node) || ts.isFunctionDeclaration(node)) {
-      const componentName = node.name?.text;
-      if (componentName && isReactComponent(node)) {
-        const props = extractReactProps(node);
-        const genericTypes = extractGenericTypes(node);
-        components.push({ name: componentName, props, genericTypes });
-      }
-    }
-    if (ts.isImportDeclaration(node)) {
-      const importPath = node.moduleSpecifier.getText().replace(/['"]/g, '');
-      const importNames = [];
-      let defaultImport = '';
-
-      if (node.importClause) {
-        if (node.importClause.name) {
-          defaultImport = node.importClause.name.getText();
-        }
-
-        if (node.importClause.namedBindings) {
-          if (ts.isNamedImports(node.importClause.namedBindings)) {
-            node.importClause.namedBindings.elements.forEach((element) => {
-              importNames.push(element.name.getText());
-            });
-          } else if (ts.isNamespaceImport(node.importClause.namedBindings)) {
-            importNames.push(node.importClause.namedBindings.name.getText());
-          }
-        }
-      }
-
-      imports.push({ path: importPath, names: importNames, defaultImport });
-    }
-    // Extract export information
-    if (ts.isExportDeclaration(node)) {
-      console.log("ts.isExportDeclaration")
-      if (node.exportClause && node.exportClause.elements) {
-        node.exportClause.elements.forEach((element) => {
-          exports.push({ name: element.name.getText(), type: "variable" });
-        });
-      } else if (node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
-        const exportedModule = node.moduleSpecifier.text;
-        exports.push({ name: `* as ${exportedModule}`, type: "module" });
-      }
-    } else if (ts.isExportAssignment(node)) {
-      console.log("ts.isExportAssignment")
-      if (ts.isIdentifier(node.expression)) {
-        exports.push({ name: "default", type: "variable" });
-      } else if (ts.isFunctionDeclaration(node.expression)) {
-        exports.push({ name: "default", type: "function" });
-      } else if (ts.isClassDeclaration(node.expression)) {
-        exports.push({ name: "default", type: "class" });
-      } else if (ts.isCallExpression(node.expression)) {
-        exports.push({ name: "default", type: "function" });
-      }
-    } else if (ts.isVariableStatement(node) && node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.ExportKeyword)) {
-      node.declarationList.declarations.forEach((declaration) => {
-        if (ts.isVariableDeclaration(declaration)) {
-          console.log("isVariableDeclaration")
-          const variableName = declaration.name.getText();
-          const { type, value } = extractValue(declaration.initializer, declaration.name.getText());
-          console.log("adding:::", { name: variableName, type, value })
-          exports.push({ name: variableName, type, value });
-        }
-      });
-    }
-
-    // Extract default exported declarations
-    if (node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.ExportKeyword) &&
-      node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.DefaultKeyword)) {
-      if (ts.isFunctionDeclaration(node)) {
-        const functionName = node.name ? node.name.getText() : 'anonymous';
-        exports.push({ name: "default", type: "function" });
-
-        // Extract function information
-        const parameters = node.parameters.map((param) => {
-          const paramType = extractType(param.type);
-          if (ts.isObjectBindingPattern(param.name)) {
-            const elements = param.name.elements.map((element) => {
-              const name = element.name.getText();
-              const type = paramType.find((prop) => prop.name === name)?.type || 'any';
-              return { name, type };
-            });
-            return elements;
-          } else {
-            const paramName = param.name.getText();
-            return { name: paramName, type: paramType };
-          }
-        }).flat();
-        const returnType = node.type ? extractType(node.type) : 'void';
-        const genericTypes = extractGenericTypes(node);
-        const isAsync = node.modifiers?.some(mod => mod.kind === ts.SyntaxKind.AsyncKeyword);
-        functions.push({ name: functionName, parameters, returnType, genericTypes, isAsync });
-      } else if (ts.isVariableDeclaration(node)) {
-        console.log("isVariableDeclaration")
-        exports.push({ name: "default", type: "variable" });
-      }
-    }
-
-    // Extract named export information
-    ts.forEachChild(node, (child) => {
-      if (ts.isVariableStatement(child)) {
-        child.declarationList.declarations.forEach((declaration) => {
-          if (declaration.initializer && isExportedDeclaration(declaration)) {
-            console.log("isExportedDeclaration")
-            const exportName = declaration.name.getText();
-            const exportValue = extractValue(declaration.initializer);
-            exports.push({ name: exportName, type: "variable", value: exportValue });
-          }
-        });
-      } else if (ts.isFunctionDeclaration(child) && child.name && isExportedDeclaration(child)) {
-        const exportName = child.name.text;
-        const isAsync = child.modifiers?.some(mod => mod.kind === ts.SyntaxKind.AsyncKeyword);
-        exports.push({ name: exportName, type: isAsync ? "asyncFunction" : "function" });
-
-        // Extract function information
-        const functionName = child.name.text;
-        const parameters = child.parameters.map((param) => {
-          const paramType = extractType(param.type);
-          if (ts.isObjectBindingPattern(param.name)) {
-            const elements = param.name.elements.map((element) => {
-              const name = element.name.getText();
-              const type = paramType.find((prop) => prop.name === name)?.type || 'any';
-              return { name, type };
-            });
-            return elements;
-          } else {
-            const paramName = param.name.getText();
-            return { name: paramName, type: paramType };
-          }
-        }).flat();
-        console.log("ts.isFunctionDeclaration parameters", parameters)
-        const returnType = child.type ? extractType(child.type) : 'void';
-        const genericTypes = extractGenericTypes(child);
-        functions.push({ name: functionName, parameters, returnType, genericTypes, isAsync });
-      } else if (ts.isClassDeclaration(child) && child.name && isExportedDeclaration(child)) {
-        const exportName = child.name.text;
-        exports.push({ name: exportName, type: "class" });
-      } else if (ts.isInterfaceDeclaration(child) && child.name && isExportedDeclaration(child)) {
-        const exportName = child.name.text;
-        exports.push({ name: exportName, type: "interface" });
-      } else if (ts.isTypeAliasDeclaration(child) && child.name && isExportedDeclaration(child)) {
-        const exportName = child.name.text;
-        exports.push({ name: exportName, type: "typeAlias" });
-      } else if (ts.isEnumDeclaration(child) && child.name && isExportedDeclaration(child)) {
-        const exportName = child.name.text;
-        exports.push({ name: exportName, type: "enum" });
-      }
-    });
+    const { file, classes, functions, imports, exports, usages } = extractDetails(program, compilerHost, checker, sourceFile);
+    cache[file] = { classes, functions, imports, exports, usages }
   });
 
-  // Extract usage relationships
-  classes.forEach((classObj) => {
-    const classUsages = [];
-
-    // Find class usages in other classes, interfaces, and functions
-    sourceFile.forEachChild((node) => {
-      if (ts.isClassDeclaration(node) && node.name && node.name.text !== classObj.name) {
-        const otherClassName = node.name.text;
-        if (node.heritageClauses?.some((clause) => clause.types.some((type) => type.expression.getText() === classObj.name))) {
-          classUsages.push(otherClassName);
-        }
-      } else if (ts.isInterfaceDeclaration(node) && node.name) {
-        const interfaceName = node.name.text;
-        if (node.heritageClauses?.some((clause) => clause.types.some((type) => type.expression.getText() === classObj.name))) {
-          classUsages.push(interfaceName);
-        }
-      } else if (ts.isFunctionDeclaration(node) && node.name) {
-        const functionName = node.name.text;
-        if (node.parameters.some((param) => param.type?.getText() === classObj.name)) {
-          classUsages.push(functionName);
-        }
-      }
-    });
-
-    classObj.usages = classUsages;
-  });
-
-  interfaces.forEach((interfaceObj) => {
-    const interfaceUsages = [];
-
-    // Find interface usages in classes and functions
-    sourceFile.forEachChild((node) => {
-      if (ts.isClassDeclaration(node) && node.name) {
-        const className = node.name.text;
-        if (node.heritageClauses?.some((clause) => clause.types.some((type) => type.expression.getText() === interfaceObj.name))) {
-          interfaceUsages.push(className);
-        }
-      } else if (ts.isFunctionDeclaration(node) && node.name) {
-        const functionName = node.name.text;
-        if (node.parameters.some((param) => param.type?.getText() === interfaceObj.name)) {
-          interfaceUsages.push(functionName);
-        }
-      }
-    });
-
-    interfaceObj.usages = interfaceUsages;
-  });
-
-  return { classes, interfaces, types, enums, functions, imports, exports, components };
+  return cache[filePath]
 }
 
 // Function to check if a node represents a React component
@@ -449,6 +460,9 @@ function isJSXElement(node) {
 }
 
 function extractValue(node, label) {
+  if (!node) {
+    return undefined;
+  }
   if (ts.isObjectLiteralExpression(node)) {
     const properties = {};
     node.properties.forEach((property) => {
@@ -489,7 +503,7 @@ function extractReactProps(node) {
   if (ts.isFunctionDeclaration(node)) {
     node.parameters.forEach((param) => {
       if (ts.isParameter(param) && param.type) {
-        const paramType = extractType(param.type);
+        const paramType = extractType(param.type).flat();
         console.log("Returning prop type", paramType, param.name.text)
         props.push({ name: param.name.text, type: paramType });
       }
@@ -499,7 +513,7 @@ function extractReactProps(node) {
       if (isFunctionExpression(declaration) && declaration.initializer.parameters) {
         declaration.initializer.parameters.forEach((param) => {
           if (ts.isParameter(param) && param.type) {
-            const paramType = extractType(param.type);
+            const paramType = extractType(param.type).flat();
             console.log("Returning prop type", paramType, param.name.text)
             props.push({ name: param.name.text, type: paramType });
           }
@@ -509,10 +523,12 @@ function extractReactProps(node) {
   }
   return props;
 }
+
 // Function to extract the type from a node
+// Returns string[] of types
 function extractType(node) {
   if (!node) {
-    return 'any';
+    return ['any'];
   }
 
   if (ts.isTypeLiteralNode(node)) {
@@ -521,7 +537,7 @@ function extractType(node) {
       .filter(ts.isPropertySignature)
       .map((member) => ({
         name: member.name.getText(),
-        type: extractType(member.type),
+        type: extractType(member.type).flat(),
       }));
     console.log("returning", properties, node?.name, node?.typeName)
     return properties;
@@ -530,16 +546,25 @@ function extractType(node) {
     const typeArguments = node.typeArguments
       ? node.typeArguments.map(extractType)
       : [];
-    console.log("isTypeReferenceNode", typeName, `<${typeArguments.map(JSON.stringify).join(', ')}>`)
-    return `${typeName}${typeArguments.length > 0 ? `<${typeArguments.map(JSON.stringify).join(', ')}>` : ''}`;
+    if (typeArguments && typeArguments.length > 0) {
+      console.log("isTypeReferenceNode", typeName, typeArguments)
+      return [`${typeName}<${typeArguments.map(JSON.stringify).join(', ')}>`];
+    } else {
+      console.log("isTypeReferenceNode", typeName)
+      return [typeName];
+    }
   } else if (ts.isArrayTypeNode(node)) {
-    const elementType = extractType(node.elementType);
+    const elementType = extractType(node.elementType).flat();
     console.log("isArrayTypeNode", elementType)
-    return `${elementType}[]`;
-  } else {
+    return elementType;
+  } else if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) {
+    return node.types.map(extractType).flat();
+  } else if (node.getText()) {
     console.log("else getText", node?.name, node.getText())
-    return node.getText();
+    return [node.getText()];
   }
+
+  console.log('nononono', node)
 }
 
 // Helper function to infer the return type of a function
@@ -548,10 +573,10 @@ function inferReturnType(node) {
   if (returnStatement) {
     const returnExpression = returnStatement.expression;
     if (returnExpression) {
-      return extractType(returnExpression);
+      return extractType(returnExpression).flat();
     }
   }
-  return 'void';
+  return ['void'];
 }
 
 // Helper function to find the return statement within a function
@@ -729,19 +754,19 @@ async function processDirectory(directory, maxContextSize, outputFile, onlyMerma
 const directoryPath = '/home/acidhax/dev/originals/dataset-manager-nextjs/'; // Replace with the path to your TypeScript directory
 const maxContextSize = 8000; // Specify the maximum context size in characters
 
-if (mermaid?.initialize) {
-  // Initialize Mermaid
-  mermaid.initialize({
-    startOnLoad: true,
-  });
-}
+// if (mermaid?.initialize) {
+//   // Initialize Mermaid
+//   mermaid.initialize({
+//     startOnLoad: true,
+//   });
+// }
 
 // chunkTypeScriptFiles(directoryPath, maxContextSize);
 // processDirectory(directoryPath, maxContextSize, 'crawled.jsonl');
 
 (async () => {
   try {
-    const filePath = '/home/acidhax/dev/originals/dataset-manager-nextjs/src/app/hooks/useProjectConfig.ts';
+    const filePath = '/home/acidhax/dev/originals/dataset-manager-nextjs/src/app/page.tsx';
     const code = await fs.promises.readFile(filePath, 'utf-8');
     const parsedData = parseTypeScriptCode(code, filePath);
     console.log(JSON.stringify(parsedData, null, 2));

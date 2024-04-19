@@ -9,6 +9,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "dataloader": "^2.2.2",
     "mermaid": "^10.9.0",
     "minimatch": "^9.0.4",
     "typescript": "^5.4.5"
